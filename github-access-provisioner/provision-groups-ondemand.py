@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""
+provision-groups-ondemand.py
+Full end-to-end pipeline:
+  Phase 1 — Azure: Assign group to Enterprise App + trigger on-demand SCIM provisioning
+  Phase 2 — GitHub: Create team + link to IDP external group
+  Phase 3 — GitHub: Assign Write permission to the repo
+
+Authentication:
+  Uses Azure Service Principal — no interactive login required.
+  All credentials are read from environment variables (GitHub Actions secrets).
+
+Required environment variables:
+  AZURE_CLIENT_ID       — App Registration client ID
+  AZURE_TENANT_ID       — Azure AD tenant ID
+  AZURE_CLIENT_SECRET   — App Registration client secret
+  GH_PAT                — GitHub Classic PAT (admin:org + repo, SSO-authorized for cato-networks)
+
+Usage:
+  # Manual test with CSV:
+  python3 provision-groups-ondemand.py --dry-run
+  python3 provision-groups-ondemand.py --confirm
+
+  # GitHub Actions / automation (single group, no CSV):
+  python3 provision-groups-ondemand.py --group "AG-GitHub-W-myrepo" --confirm
+"""
+
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import platform
+
+# ====== CORPORATE SSL FIX (macOS / Cato SSL Inspection only) ======
+if platform.system() == "Darwin":
+    _COMBINED_CA = "/tmp/combined-ca-bundle.pem"
+    _SYSTEM_CA   = "/etc/ssl/cert.pem"
+    _CATO_CA     = os.path.expanduser("~/corp-root-ca.pem")
+
+    if not os.path.exists(_COMBINED_CA):
+        if not os.path.exists(_CATO_CA):
+            subprocess.run(
+                ["security", "find-certificate", "-a", "-p", "-c",
+                 "Cato Networks Root CA", "/Library/Keychains/System.keychain"],
+                stdout=open(_CATO_CA, "w"), stderr=subprocess.DEVNULL
+            )
+        if os.path.exists(_SYSTEM_CA) and os.path.exists(_CATO_CA):
+            with open(_COMBINED_CA, "w") as _out:
+                for _f in [_SYSTEM_CA, _CATO_CA]:
+                    with open(_f) as _src:
+                        _out.write(_src.read())
+            print(f"  SSL bundle built: {_COMBINED_CA}", flush=True)
+        else:
+            print(f"  WARNING: Could not build SSL bundle — exiting.")
+            sys.exit(1)
+    os.environ["REQUESTS_CA_BUNDLE"] = _COMBINED_CA
+    os.environ["SSL_CERT_FILE"]      = _COMBINED_CA
+else:
+    print("  Running on Linux — skipping macOS SSL fix.", flush=True)
+
+# ====== CREDENTIALS FROM ENVIRONMENT ======
+AZURE_CLIENT_ID     = os.environ.get("AZURE_CLIENT_ID", "")
+AZURE_TENANT_ID     = os.environ.get("AZURE_TENANT_ID", "")
+AZURE_CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "")
+GH_PAT              = os.environ.get("GH_PAT", "")
+
+# ====== CONFIG ======
+CSV_FILE  = "test-ondemand.csv"
+DRY_RUN   = "--dry-run" in sys.argv
+CONFIRM   = "--confirm" in sys.argv
+
+# Single group mode (--group argument) — used by GitHub Actions
+GROUP_ARG = None
+for i, arg in enumerate(sys.argv):
+    if arg == "--group" and i + 1 < len(sys.argv):
+        GROUP_ARG = sys.argv[i + 1]
+
+# Azure — GitHub Enterprise App
+SP_OBJECT_ID = "8882e28a-ae1d-43ae-bd12-c7ccee1a02ca"
+APP_ROLE_ID  = "27d9891d-2c17-4f45-a262-781a0e55c80a"   # "User" role
+
+# GitHub
+ORG     = "cato-networks"
+GH_API  = "https://api.github.com"
+
+
+# ==============================================================
+#  VALIDATE SECRETS
+# ==============================================================
+def validate_secrets():
+    missing = []
+    if not AZURE_CLIENT_ID:     missing.append("AZURE_CLIENT_ID")
+    if not AZURE_TENANT_ID:     missing.append("AZURE_TENANT_ID")
+    if not AZURE_CLIENT_SECRET: missing.append("AZURE_CLIENT_SECRET")
+    if not GH_PAT:              missing.append("GH_PAT")
+
+    if missing:
+        print(f"\n  ERROR: Missing required environment variables:")
+        for m in missing:
+            print(f"    - {m}")
+        print(f"\n  Export them before running:")
+        print(f"    export AZURE_CLIENT_ID=...")
+        print(f"    export AZURE_TENANT_ID=...")
+        print(f"    export AZURE_CLIENT_SECRET=...")
+        print(f"    export GH_PAT=ghp_...")
+        sys.exit(1)
+
+
+# ==============================================================
+#  HELPERS — Azure (az CLI with Service Principal)
+# ==============================================================
+def run_az(args):
+    result = subprocess.run(["az"] + args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+
+
+def az_login():
+    """Login using Service Principal — no browser, no device code."""
+    print(f"  Logging in as Service Principal...", flush=True)
+    ok, out, err = run_az([
+        "login", "--service-principal",
+        "--username", AZURE_CLIENT_ID,
+        "--password", AZURE_CLIENT_SECRET,
+        "--tenant",   AZURE_TENANT_ID,
+        "--allow-no-subscriptions"
+    ])
+    if not ok:
+        print(f"  ERROR: Service Principal login failed: {err[:300]}", flush=True)
+        sys.exit(1)
+
+    print(f"  Logged in as SP : {AZURE_CLIENT_ID}", flush=True)
+    print(f"  Tenant          : {AZURE_TENANT_ID}", flush=True)
+
+
+def az_get_group_id(group_name):
+    ok, out, _ = run_az(["ad", "group", "show", "--group", group_name, "--query", "id", "-o", "tsv"])
+    return out.strip() if ok and out.strip() else None
+
+
+def az_is_assigned(group_id):
+    ok, out, _ = run_az([
+        "rest", "--method", "GET",
+        "--uri", f"https://graph.microsoft.com/v1.0/servicePrincipals/{SP_OBJECT_ID}/appRoleAssignedTo",
+        "--query", "value[].principalId", "-o", "tsv"
+    ])
+    return ok and group_id.lower() in out.lower()
+
+
+def az_assign_group(group_id):
+    body = json.dumps({"principalId": group_id, "resourceId": SP_OBJECT_ID, "appRoleId": APP_ROLE_ID})
+    ok, out, err = run_az([
+        "rest", "--method", "POST",
+        "--uri", f"https://graph.microsoft.com/v1.0/servicePrincipals/{SP_OBJECT_ID}/appRoleAssignedTo",
+        "--headers", "Content-Type=application/json",
+        "--body", body
+    ])
+    if not ok and "already exists" in err.lower():
+        return True, "already assigned"
+    return ok, err[:200]
+
+
+def az_get_sync_job_id():
+    ok, out, _ = run_az([
+        "rest", "--method", "GET",
+        "--uri", f"https://graph.microsoft.com/v1.0/servicePrincipals/{SP_OBJECT_ID}/synchronization/jobs",
+        "--query", "value[0].id", "-o", "tsv"
+    ])
+    return out.strip() if ok and out.strip() else None
+
+
+def az_get_sync_rule_id(job_id):
+    ok, out, _ = run_az([
+        "rest", "--method", "GET",
+        "--uri", f"https://graph.microsoft.com/v1.0/servicePrincipals/{SP_OBJECT_ID}"
+                 f"/synchronization/jobs/{job_id}/schema",
+        "--query", "synchronizationRules[0].id", "-o", "tsv"
+    ])
+    return out.strip() if ok and out.strip() else None
+
+
+def az_provision_on_demand(job_id, rule_id, group_id, retries=3, retry_delay=15):
+    body = json.dumps({
+        "parameters": [{
+            "subjects": [{"objectId": group_id, "objectTypeName": "Group"}],
+            "ruleId": rule_id
+        }]
+    })
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            print(f"  Retry {attempt}/{retries} — waiting {retry_delay}s...", flush=True)
+            time.sleep(retry_delay)
+
+        ok, out, err = run_az([
+            "rest", "--method", "POST",
+            "--uri", f"https://graph.microsoft.com/v1.0/servicePrincipals/{SP_OBJECT_ID}"
+                     f"/synchronization/jobs/{job_id}/provisionOnDemand",
+            "--headers", "Content-Type=application/json",
+            "--body", body
+        ])
+        if not ok:
+            print(f"  Attempt {attempt} failed: {err[:200]}", flush=True)
+            continue
+        try:
+            result    = json.loads(out)
+            raw_value = result.get("value", "")
+            entries   = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+            entry     = entries[0] if entries else {}
+            steps     = entry.get("provisioningSteps", [])
+            for step in steps:
+                icon = "✅" if step.get("status","").lower() == "success" else "❌"
+                print(f"    {icon} {step.get('name')}: {step.get('status')} — {step.get('description','')}", flush=True)
+            final  = steps[-1].get("status", "unknown") if steps else "unknown"
+            action = entry.get("action", "")
+            if final.lower() == "success":
+                return True, f"Action: {action} | Final step: {final}"
+            last_desc = steps[-1].get("description", "") if steps else ""
+            # Already in sync = success (group existed in GitHub from before)
+            if "already match" in last_desc.lower():
+                print(f"  Group already synced in GitHub — no changes needed", flush=True)
+                return True, f"Action: {action} | Already in sync"
+            # Not yet assigned = retry
+            if "not assigned" in last_desc.lower():
+                print(f"  Group not yet recognized as assigned — retrying...", flush=True)
+                continue
+            return False, f"Action: {action} | Final step: {final}"
+        except Exception as e:
+            print(f"  Attempt {attempt} — could not parse response: {e}", flush=True)
+            continue
+    return False, "All retry attempts failed"
+
+
+# ==============================================================
+#  HELPERS — GitHub (curl)
+# ==============================================================
+def gh_curl(method, path, body=None):
+    cmd = [
+        "curl", "-s", "-X", method,
+        "-H", f"Authorization: token {GH_PAT}",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "X-GitHub-Api-Version: 2022-11-28",
+    ]
+    if body:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    cmd.append(f"{GH_API}{path}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        return {}
+
+
+def gh_curl_status(method, path, body=None):
+    cmd = [
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+        "-X", method,
+        "-H", f"Authorization: token {GH_PAT}",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "X-GitHub-Api-Version: 2022-11-28",
+    ]
+    if body:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    cmd.append(f"{GH_API}{path}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return int(result.stdout.strip())
+    except Exception:
+        return 0
+
+
+def check_gh_token():
+    data  = gh_curl("GET", "/user")
+    login = data.get("login", "")
+    if not login:
+        print("  ERROR: GH_PAT is invalid or SSO not authorized for cato-networks.", flush=True)
+        print("  → Go to github.com/settings/tokens → Configure SSO → Authorize cato-networks", flush=True)
+        sys.exit(1)
+    org_data = gh_curl("GET", f"/orgs/{ORG}")
+    org_id   = org_data.get("id", "")
+    if not org_id:
+        print(f"  ERROR: Could not resolve org ID for '{ORG}'. Check SSO authorization.", flush=True)
+        sys.exit(1)
+    print(f"  GitHub user   : {login}", flush=True)
+    print(f"  GitHub org    : {ORG} (id: {org_id})", flush=True)
+    return login, str(org_id)
+
+
+def gh_fetch_external_groups():
+    all_groups = []
+    page = 1
+    while True:
+        data   = gh_curl("GET", f"/orgs/{ORG}/external-groups?per_page=100&page={page}")
+        groups = data.get("groups", [])
+        if not groups:
+            break
+        all_groups.extend(groups)
+        page += 1
+    return {g["group_name"]: g for g in all_groups}
+
+
+def to_slug(name):
+    s = name.lower()
+    s = re.sub(r"[^a-z0-9-]", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def extract_repo(group_name):
+    return re.sub(r"^ag-github-w-", "", group_name.lower())
+
+
+# ==============================================================
+#  PHASE 2 — Create GitHub Team + link IDP group
+# ==============================================================
+def phase2_create_team(group_name, idp_lookup, org_id, gh_user, dry_run):
+    team_slug = to_slug(group_name)
+
+    existing = gh_curl("GET", f"/orgs/{ORG}/teams/{team_slug}")
+    if existing.get("slug") == team_slug:
+        print(f"  [Team] Already exists — skipped", flush=True)
+        return True, team_slug, "skipped"
+
+    idp_entry = idp_lookup.get(group_name)
+    if not idp_entry:
+        print(f"  [Team] ERROR: External group '{group_name}' not found in GitHub — SCIM may not have synced yet", flush=True)
+        return False, None, "failed"
+
+    idp_group_id = idp_entry["group_id"]
+    print(f"  [Team] IDP group found — id: {idp_group_id}", flush=True)
+
+    if dry_run:
+        print(f"  [Team] [DRY RUN] Would create team '{group_name}' (slug: {team_slug})", flush=True)
+        print(f"  [Team] [DRY RUN] Would link to IDP group id: {idp_group_id}", flush=True)
+        return True, team_slug, "dry_run"
+
+    group_desc = f"GitHub Write access — {extract_repo(group_name)}"
+    create_result = gh_curl("POST", f"/orgs/{ORG}/teams", body={
+        "name":                 group_name,
+        "description":          group_desc,
+        "privacy":              "closed",
+        "notification_setting": "notifications_enabled"
+    })
+    actual_slug = create_result.get("slug", "")
+    team_id     = create_result.get("id", "")
+    if not actual_slug:
+        print(f"  [Team] ERROR: Failed to create team — {create_result.get('message','unknown')}", flush=True)
+        return False, None, "failed"
+    print(f"  [Team] Created — slug: {actual_slug} (id: {team_id})", flush=True)
+
+    del_status = gh_curl_status("DELETE", f"/orgs/{ORG}/teams/{actual_slug}/memberships/{gh_user}")
+    print(f"  [Team] Creator removed from membership (status: {del_status})", flush=True)
+
+    link_result = gh_curl("PATCH", f"/organizations/{org_id}/team/{team_id}/external-groups",
+                          body={"group_id": int(idp_group_id)})
+    err_msg = link_result.get("message", "")
+    if err_msg:
+        print(f"  [Team] ERROR linking IDP group: {err_msg}", flush=True)
+        return False, actual_slug, "failed"
+
+    print(f"  [Team] IDP group linked ✅", flush=True)
+    return True, actual_slug, "created"
+
+
+# ==============================================================
+#  PHASE 3 — Assign Write permission to repo
+# ==============================================================
+def phase3_assign_repo(group_name, team_slug, dry_run):
+    repo_name = extract_repo(group_name)
+    print(f"  [Repo] Name: {repo_name}", flush=True)
+
+    repo_data = gh_curl("GET", f"/repos/{ORG}/{repo_name}")
+    if not repo_data.get("name"):
+        print(f"  [Repo] ERROR: Repository '{ORG}/{repo_name}' not found", flush=True)
+        return False
+
+    print(f"  [Repo] Exists ✅", flush=True)
+
+    current      = gh_curl("GET", f"/orgs/{ORG}/teams/{team_slug}/repos/{ORG}/{repo_name}")
+    current_perm = current.get("permissions", {})
+    if current_perm.get("push"):
+        print(f"  [Repo] Write permission already assigned — skipped", flush=True)
+        return True
+
+    if dry_run:
+        print(f"  [Repo] [DRY RUN] Would assign Write permission to {ORG}/{repo_name}", flush=True)
+        return True
+
+    status = gh_curl_status("PUT", f"/orgs/{ORG}/teams/{team_slug}/repos/{ORG}/{repo_name}",
+                             body={"permission": "push"})
+    if status in (200, 204):
+        print(f"  [Repo] Write permission assigned ✅", flush=True)
+        return True
+    else:
+        print(f"  [Repo] ERROR: Could not assign permission (HTTP {status})", flush=True)
+        return False
+
+
+# ==============================================================
+#  READ INPUT — CSV or --group argument
+# ==============================================================
+def get_groups():
+    if GROUP_ARG:
+        print(f"  Input mode    : --group argument", flush=True)
+        return [GROUP_ARG]
+    if not os.path.exists(CSV_FILE):
+        print(f"  ERROR: No --group argument provided and CSV file '{CSV_FILE}' not found.")
+        print(f"  Usage:")
+        print(f"    python3 provision-groups-ondemand.py --group 'AG-GitHub-W-myrepo' --confirm")
+        sys.exit(1)
+    print(f"  Input mode    : CSV ({CSV_FILE})", flush=True)
+    groups = []
+    with open(CSV_FILE, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            name = row.get("GroupName", "").strip()
+            if name:
+                groups.append(name)
+    return groups
+
+
+# ==============================================================
+#  MAIN
+# ==============================================================
+print("\n" + "=" * 60)
+print("  Full Pipeline: Azure SCIM + GitHub Team + Repo Permission")
+print("=" * 60)
+
+if not DRY_RUN and not CONFIRM:
+    print(f"\n  Manual run with CSV:")
+    print(f"    python3 provision-groups-ondemand.py --dry-run")
+    print(f"    python3 provision-groups-ondemand.py --confirm")
+    print(f"\n  Automation run with single group:")
+    print(f"    python3 provision-groups-ondemand.py --group 'AG-GitHub-W-myrepo' --confirm")
+    print("\n  Aborted. Nothing was changed.")
+    sys.exit(0)
+
+# Validate all secrets are present
+validate_secrets()
+
+# Azure login via Service Principal
+print("\n  [ Azure ]")
+az_login()
+
+# GitHub token check
+print("\n  [ GitHub ]")
+GH_USER, ORG_ID = check_gh_token()
+
+# Get groups
+groups = get_groups()
+total  = len(groups)
+
+print(f"\n  Total groups  : {total}")
+print(f"  Mode          : {'DRY RUN (no changes)' if DRY_RUN else 'REAL RUN — PRODUCTION'}")
+print("=" * 60)
+
+if not DRY_RUN:
+    print("\n  Fetching Azure sync job ID...")
+    JOB_ID = az_get_sync_job_id()
+    if not JOB_ID:
+        print("  ERROR: Cannot get sync job ID.")
+        sys.exit(1)
+    print(f"  Sync job ID   : {JOB_ID}", flush=True)
+
+    RULE_ID = az_get_sync_rule_id(JOB_ID)
+    if not RULE_ID:
+        print("  ERROR: Cannot get sync rule ID.")
+        sys.exit(1)
+    print(f"  Sync rule ID  : {RULE_ID}", flush=True)
+
+    print("\n  Fetching GitHub external groups (IDP)...")
+    IDP_LOOKUP = gh_fetch_external_groups()
+    print(f"  External groups found : {len(IDP_LOOKUP)}", flush=True)
+else:
+    JOB_ID     = None
+    RULE_ID    = None
+    IDP_LOOKUP = gh_fetch_external_groups()
+    print(f"\n  GitHub external groups found : {len(IDP_LOOKUP)}", flush=True)
+
+p1_assigned = p1_skipped = p1_provisioned = p1_failed = 0
+p2_created  = p2_skipped = p2_failed = 0
+p3_assigned = p3_skipped = p3_failed = 0
+not_found   = 0
+
+for i, group_name in enumerate(groups, 1):
+    print(f"\n{'='*60}", flush=True)
+    print(f"[{i}/{total}] {group_name}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    # Phase 1 — Azure SCIM
+    print(f"\n  -- Phase 1: Azure SCIM --", flush=True)
+    group_id = az_get_group_id(group_name)
+    if not group_id:
+        print(f"  ERROR: Group not found in Azure AD — skipping", flush=True)
+        not_found += 1
+        continue
+    print(f"  Object ID : {group_id}", flush=True)
+
+    if az_is_assigned(group_id):
+        print(f"  App assignment : Already assigned — skipped", flush=True)
+        p1_skipped += 1
+    elif DRY_RUN:
+        print(f"  [DRY RUN] Would assign to Enterprise App", flush=True)
+    else:
+        ok, err = az_assign_group(group_id)
+        if ok:
+            print(f"  App assignment : Assigned OK", flush=True)
+            p1_assigned += 1
+            print(f"  Waiting 20s for assignment to propagate...", flush=True)
+            time.sleep(20)
+        else:
+            print(f"  App assignment : FAILED — {err}", flush=True)
+            p1_failed += 1
+            continue
+
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would trigger on-demand SCIM provisioning", flush=True)
+    else:
+        print(f"  Triggering on-demand SCIM provisioning...", flush=True)
+        ok, msg = az_provision_on_demand(JOB_ID, RULE_ID, group_id)
+        if ok:
+            print(f"  Provisioning : ✅ {msg}", flush=True)
+            p1_provisioned += 1
+            print(f"  Waiting 10s for GitHub to process SCIM sync...", flush=True)
+            time.sleep(10)
+            IDP_LOOKUP = gh_fetch_external_groups()
+        else:
+            print(f"  Provisioning : ❌ FAILED — {msg}", flush=True)
+            p1_failed += 1
+            continue
+
+    # Phase 2 — GitHub Team
+    print(f"\n  -- Phase 2: GitHub Team --", flush=True)
+    ok, team_slug, p2_status = phase2_create_team(group_name, IDP_LOOKUP, ORG_ID, GH_USER, DRY_RUN)
+    if not ok:
+        p2_failed += 1
+        continue
+    if p2_status == "created":
+        p2_created += 1
+    elif p2_status == "skipped":
+        p2_skipped += 1
+
+    # Phase 3 — Repo Permission
+    print(f"\n  -- Phase 3: Repo Permission --", flush=True)
+    ok = phase3_assign_repo(group_name, team_slug or to_slug(group_name), DRY_RUN)
+    if ok:
+        p3_assigned += 1
+    else:
+        p3_failed += 1
+
+# Summary
+print(f"\n{'='*60}")
+print(f"  SUMMARY")
+print(f"{'='*60}")
+print(f"  Total groups       : {total}")
+print(f"  Not found in Azure : {not_found}")
+print(f"\n  Phase 1 — SCIM")
+print(f"    Assigned (new)   : {p1_assigned}")
+print(f"    Already assigned : {p1_skipped}")
+print(f"    Provisioned      : {p1_provisioned}")
+print(f"    Failed           : {p1_failed}")
+print(f"\n  Phase 2 — GitHub Teams")
+print(f"    Created          : {p2_created}")
+print(f"    Already existed  : {p2_skipped}")
+print(f"    Failed           : {p2_failed}")
+print(f"\n  Phase 3 — Repo Permissions")
+print(f"    Assigned/skipped : {p3_assigned}")
+print(f"    Failed           : {p3_failed}")
+print(f"{'='*60}")
