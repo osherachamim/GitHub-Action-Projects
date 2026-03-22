@@ -1,0 +1,44 @@
+name: GitHub Access Provisioning - Freshdesk
+
+on:
+  # Triggered by Freshdesk webhook
+  # Freshdesk body:
+  # {
+  #   "event_type": "provision-github-access",
+  #   "client_payload": { "repoName": "{{ticket.ri_214_cf_reponame}}" }
+  # }
+  repository_dispatch:
+    types: [provision-github-access]
+
+jobs:
+  provision:
+    name: Provision GitHub Access
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve group name
+        id: vars
+        run: |
+          REPO_NAME="${{ github.event.client_payload.repoName }}"
+          GROUP="AG-GitHub-W-${REPO_NAME}"
+          echo "group_name=${GROUP}" >> $GITHUB_OUTPUT
+          echo "Group : ${GROUP}"
+
+      - name: Run provisioning pipeline
+        env:
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          GH_PAT:              ${{ secrets.GH_PAT }}
+        run: |
+          GROUP="${{ steps.vars.outputs.group_name }}"
+          echo "Group name : $GROUP"
+          python3 provision-groups-ondemand.py --group "$GROUP" --confirm
