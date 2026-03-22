@@ -18,7 +18,7 @@ Freshdesk Service Catalog
   │
   ▼
 Freshdesk Automation (Webhook)
-  │  POST /repos/cato-networks-IT/github-access-provisioner/dispatches
+  │  POST /repos/IT/github-access-provisioner/dispatches
   │  { "event_type": "provision-github-access", "client_payload": { "repoName": "myrepo" } }
   │
   ▼
