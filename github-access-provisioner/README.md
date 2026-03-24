@@ -18,7 +18,7 @@ Freshdesk Service Catalog
   │
   ▼
 Freshdesk Automation (Webhook)
-  │  POST /repos/cato-networks-IT/github-access-provisioner/dispatches
+  │  POST /repos/IT/github-access-provisioner/dispatches
   │  { "event_type": "provision-github-access", "client_payload": { "repoName": "myrepo" } }
   │
   ▼
@@ -65,7 +65,7 @@ The script derives the repo name and team slug automatically from the group name
   - `Group.Read.All`
   - `Directory.ReadWrite.All`
 
-### GitHub App — `cato-github-access-provisioner`
+### GitHub App — `github-access-provisioner`
 The pipeline uses a **GitHub App** instead of a Personal Access Token for all GitHub operations. This provides:
 - Auto-rotating tokens (no manual rotation every 90 days)
 - Audit logs show the app name, not a personal account
@@ -73,8 +73,8 @@ The pipeline uses a **GitHub App** instead of a Personal Access Token for all Gi
 - Higher API rate limits (15,000 req/hour vs 5,000 for PATs)
 
 **The app must be:**
-- Created in the `cato-networks` org
-- Installed on the `cato-networks` org with **All repositories** access
+- Created in the `IT` org
+- Installed on the `IT` org with **All repositories** access
 - Granted the following permissions:
   - Repository → `Administration`: Read & Write
   - Organization → `Members`: Read & Write
@@ -116,7 +116,7 @@ Triggered automatically by Freshdesk automation via `repository_dispatch`. Uses 
 
 **Freshdesk webhook configuration:**
 - **Method:** `POST`
-- **URL:** `https://api.github.com/repos/cato-networks-IT/github-access-provisioner/dispatches`
+- **URL:** `https://api.github.com/repos/IT/github-access-provisioner/dispatches`
 - **Credentials:** Fine-grained PAT stored in Freshdesk credential store (`Authorization: token <pat>`)
 - **Headers:**
   ```
@@ -161,7 +161,6 @@ python3 provision-groups-ondemand.py --dry-run
 python3 provision-groups-ondemand.py --confirm
 ```
 
-> **Note:** Local runs on macOS behind Cato Networks SASE require the corporate CA certificate. The script handles this automatically when running on macOS.
 
 ---
 
@@ -186,7 +185,7 @@ Full Pipeline: Azure SCIM + GitHub Team + Repo Permission
 [ Azure ]
   Tenant       : d03fe63f-ee56-4020-a121-dd5b65bc7ea3
 [ GitHub ]
-  GitHub org   : cato-networks (id: 248302678)
+  GitHub org   : MYProj (id: 248302678)
   Group        : AG-GitHub-W-myrepo
 ============================================================
 
