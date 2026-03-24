@@ -1,4 +1,4 @@
-name: GitHub Access Provisioning - Freshdesk
+name: GitHub Access Provisioning (App Auth)
 
 on:
   # Triggered by Freshdesk webhook
@@ -19,6 +19,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: cato-networks
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -37,7 +45,7 @@ jobs:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          GH_PAT:              ${{ secrets.GH_PAT }}
+          GH_APP_TOKEN:        ${{ steps.app-token.outputs.token }}
         run: |
           GROUP="${{ steps.vars.outputs.group_name }}"
           echo "Group name : $GROUP"
