@@ -388,10 +388,20 @@ def phase3_assign_repo(group_name, team_slug, dry_run):
                              body={"permission": "push"})
     if status in (200, 204):
         print(f"  [Repo] Write permission assigned ✅", flush=True)
-        return True
     else:
         print(f"  [Repo] ERROR: Could not assign permission (HTTP {status})", flush=True)
         return False
+
+    # Remove the app/service account from direct repo collaborators if present
+    collaborators = gh_curl("GET", f"/repos/{ORG}/{repo_name}/collaborators?affiliation=direct")
+    if isinstance(collaborators, list):
+        for collab in collaborators:
+            username = collab.get("login", "")
+            if username:
+                del_status = gh_curl_status("DELETE", f"/repos/{ORG}/{repo_name}/collaborators/{username}")
+                print(f"  [Repo] Removed direct collaborator '{username}' (status: {del_status})", flush=True)
+
+    return True
 
 
 # ==============================================================
